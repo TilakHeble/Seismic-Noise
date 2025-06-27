@@ -1,0 +1,1383 @@
+---
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r}
+# Set working directory to where your CSVs live
+setwd("C:/Users/Tilak Heble/OneDrive/Desktop/Seismic Noise")
+
+# 1. Load required libraries
+# Helper function to install and load packages
+load_if_needed <- function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# List of required packages
+packages <- c(
+  "tidyverse",   # Core data science tools: dplyr, ggplot2, readr, etc.
+  "readxl",      # Read Excel files (.xls and .xlsx)
+  "lubridate",   # Date/time manipulation: ymd(), hour(), etc.
+  "mgcv",        # Fit GAM (Generalized Additive Models)
+  "gratia",      # GAM model visualization and diagnostics
+  "dplyr",       # Data manipulation (part of tidyverse)
+  "ggplot2",     # Data visualization (part of tidyverse)
+  "scales",      # Custom scales (e.g., scientific notation in plots)
+  "openair",     # Air quality data tools and plotting (from UK AURN)
+  "RColorBrewer",# Color palettes for plots
+  "patchwork"    # Combine multiple ggplots into one layout
+)
+
+# Install and load each package
+invisible(lapply(packages, load_if_needed))
+
+
+# 2. Define file paths
+
+# Frequency‐domain PSD @ WS12
+path_bg_fd  <- "Background_Frequency_Domain_WS12.csv"
+path_op_fd  <- "Operational_Frequency_Domain_WS12.csv"
+
+# Frequency‐distance weighting function
+path_fdwf   <- "FDWF_Data.xlsx"
+
+# 3. Import data
+# 3.1 Background PSD
+freq_bg <- read_csv(path_bg_fd)
+
+# 3.2 Operational PSD
+freq_op <- read_csv(path_op_fd)
+
+# 3.3 Frequency‐Distance Weighting Function
+fdwf    <- read_excel(path_fdwf, sheet = 1)
+
+# 3.4 Quick check
+glimpse(freq_bg)
+glimpse(freq_op)
+glimpse(fdwf)
+
+```
+
+```{r}
+# 4. Data Preprocessing 
+
+# 4.1 Standardize column names for PSD tables (background and operational)
+# Rename columns to a uniform format so they can be processed identically downstream.
+# Frequency and PSD column names are reformatted, while other fields are retained.
+freq_bg <- freq_bg %>%
+  rename(
+    Frequency_Hz = `Frequency..Hz.`,                      # frequency in Hz
+    PSD          = `PSD.Displacement..m.2.Hz.`,           # raw PSD (displacement units)
+    Date         = Date,
+    Hour         = Hour,
+    Wind.speed   = Wind.speed,                            # in m/s
+    Wind.dir.deg = `Wind.direction.degrees`               # wind direction in degrees
+  )
+
+freq_op <- freq_op %>%
+  rename(
+    Frequency_Hz = `Frequency..Hz.`,
+    PSD          = `PSD.Displacement..m.2.Hz.`,
+    Date         = Date,
+    Hour         = Hour,
+    Wind.speed   = Wind.speed,
+    Wind.dir.deg = `Wind.direction.degrees`
+  )
+
+# 4.2 Standardize FDWF table (Frequency–Distance Weighting Function)
+# Rename the columns in the FDWF table to standard names: frequency and associated weight.
+fdwf <- fdwf %>%
+  rename(
+    Frequency_Hz = Frequency_Hz,                              # frequency
+    weight       = Frequency_Distance_Weighting_Function      # FDWF value
+  )
+
+# 4.3 Merge PSD tables with FDWF and compute weighted PSD
+# Multiply raw PSD values by FDWF weights to get frequency-weighted PSD.
+# Add a new column 'Operational' to indicate turbine state (0 = background, 1 = operational).
+freq_bg <- freq_bg %>%
+  inner_join(fdwf, by = "Frequency_Hz") %>%                   # merge with weights
+  mutate(
+    PSD_wtd     = PSD * weight,                               # weighted PSD
+    Operational = 0                                           # turbine off
+  )
+
+freq_op <- freq_op %>%
+  inner_join(fdwf, by = "Frequency_Hz") %>%
+  mutate(
+    PSD_wtd     = PSD * weight,
+    Operational = 1                                           # turbine on
+  )
+
+# 4.4 Combine PSD tables and tag turbine state (Type)
+# Merge background and operational PSD data into one table.
+# Re-label wind direction and speed columns, drop missing data, and label the 'Type'.
+psd_all <- bind_rows(freq_bg, freq_op) %>%                    # merge datasets
+  rename(
+    Wind.speed = Wind.speed,                                  # rename for clarity
+    Wind.dir   = Wind.dir.deg
+  ) %>%
+  drop_na(Wind.speed, PSD_wtd) %>%                            # remove rows with missing critical values
+  mutate(
+    Type = if_else(Operational == 1, "Operational", "Background")  # human-readable label
+  )
+
+# 4.5 Integrate PSD over 0.5–8 Hz to compute Energy (E)
+# Use trapezoidal rule to numerically integrate weighted PSD into total energy in band.
+# Compute covariates like timestamp, log-energy, and date-based variables.
+energy <- psd_all %>%
+  filter(between(Frequency_Hz, 0.5, 8)) %>%                   # filter to frequency band of interest
+  arrange(Date, Hour, Frequency_Hz) %>%                       # ensure correct order for integration
+  group_by(Date, Hour, Wind.speed, Wind.dir, Operational, Type) %>%
+  summarize(
+    E = sum((PSD_wtd + lead(PSD_wtd, default = last(PSD_wtd))) / 2 * 
+            (lead(Frequency_Hz, default = last(Frequency_Hz)) - Frequency_Hz)),  # trapezoidal integration
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Datetime = ymd(Date) + hours(Hour),                       # full timestamp
+    logE     = log(E + 1e-9),                                 # log-transform energy, offset to avoid -Inf
+    DateF    = factor(Date),                                  # factor date for random effect in GAM
+    Hour     = hour(Datetime),                                # hour of day (0–23)
+    Month    = month(Datetime),                               # month (1–12)
+    Weekday  = as.integer(format(Datetime, "%u"))             # day of week (1=Mon, ..., 7=Sun)
+  ) %>%
+  drop_na(Wind.speed, E)                                      # remove rows with missing energy or wind speed
+
+# Final structure: `energy` contains all cleaned, engineered variables required for modeling.
+# Key fields include:
+#   - E, logE (integrated energy and its log)
+#   - Operational (0/1) and Type (“Background” / “Operational”)
+#   - Wind.speed, Wind.dir
+#   - Datetime, Hour, Month, Weekday (temporal)
+#   - DateF (factor for day-level random effects)
+
+glimpse(energy)  # quick check of structure
+
+```
+
+EDA & DATA VISUALIZATION
+```{r}
+#Set up for Plotting
+limit_nm <- 0.336                # compliance line for later plots
+energy   <- energy %>%
+  mutate(RMS_nm = sqrt(E) * 1e9) # m² → metres → nm
+
+```
+
+
+1. Distribution & Summary Plots
+```{r}
+### Plot 1 - Distribution of 10-minute Log-Energy (Histogram and Density)
+
+# 1. Histogram 
+p_hist <- ggplot(energy, aes(logE, fill = Type)) +                 # Set up histogram for log-energy by Type
+  geom_histogram(bins = 40, alpha = 0.6, position = "identity",    # Histogram with semi-transparency and white borders
+                 colour = "white") +
+  scale_fill_manual(values = c("#1f77b4", "#ff7f0e"), name = "") + # Custom fill colours for Type
+  labs(title = "Histogram of 10-min Log-Energy",                   # Title and axis labels
+       x = expression(log~E~"(m"^2*")"), y = "Count") +
+  theme_minimal() +                                                # Clean minimal theme
+  theme(legend.position = "none")       # legend will be shared later
+
+# 2. Density curve 
+p_dens <- ggplot(energy, aes(logE, colour = Type, fill = Type)) +  # Set up density plot for log-energy by Type
+  geom_density(alpha = .25, adjust = 1.3, linewidth = 1) +         # Smoothed density with partial fill and thicker line
+  scale_colour_manual(values = c("#1f77b4", "#ff7f0e"), name = "") + # Custom line colours
+  scale_fill_manual(values = c("#1f77b4", "#ff7f0e"), name = "") +   # Custom fill colours
+  labs(title = "Kernel Density of Log-Energy",                     # Title and axis labels
+       x = expression(log~E~"(m"^2*")"), y = "Density") +
+  theme_minimal() +                                                # Clean minimal theme
+  theme(legend.position = "none")                                  # Hide legend (to be shared in combined plot)
+
+# 3. Combine and add a shared legend 
+p_combo <- (p_hist | p_dens) +                                     # Combine histogram and density side-by-side
+           plot_layout(guides = "collect") & theme(legend.position = "bottom")  # Share and place legend below
+
+print(p_combo)                                                     # Display the combined plot
+```
+
+```{r}
+### Plot 2 - Distribution of Block Log-Energy (Kernel Density)           
+
+p_dens <- ggplot(energy,
+                 aes(x = logE,
+                     fill = factor(Operational),
+                     colour = factor(Operational))) +
+  
+  # Kernel density estimation with light transparency
+  geom_density(alpha = 0.25, adjust = 1.5) +
+
+  # Fill color: blue for background, orange for operational
+  scale_fill_manual(values = c("0" = "#1f77b4", "1" = "#ff7f0e"),
+                    labels = c("Background", "Operational"),
+                    name   = "") +
+
+  # Line color to match fill, but no legend for outlines
+  scale_colour_manual(values = c("0" = "#1f77b4", "1" = "#ff7f0e"),
+                      guide = "none") +
+
+  # Axis labels and plot title
+  labs(title = "Distribution of Block Log-Energy",
+       x = expression(log~E~"(m"^2*")"),
+       y = "Density") +
+
+  # Clean visual style
+  theme_minimal()
+
+# Display the plot
+print(p_dens)
+```
+
+```{r}
+### Plot 3 - Wind Direction Histogram (Faceted by State)
+
+# Bin wind direction into 30° sectors
+dir_df <- energy %>%
+  mutate(
+    WD_bin = cut(Wind.dir,                            # bin wind direction into intervals
+                 breaks = seq(0, 360, 30),            # 12 bins: [0,30), [30,60), ...
+                 include.lowest = TRUE, right = FALSE),
+    
+    # Set factor levels so "Operational" is plotted above "Background" in the facet layout
+    Type   = factor(Type, levels = c("Operational", "Background"))
+  ) %>%
+  count(Type, WD_bin) %>%                             # count observations per bin and state
+  group_by(Type) %>%                                  # group by turbine state
+  mutate(prop = n / sum(n) * 100) %>%                 # convert counts to percentage per state
+  ungroup()
+
+# Define colours for each turbine state
+cols <- c("Background"  = "#1f77b4",                  # blue
+          "Operational" = "#ff7f0e")                  # orange
+
+# Plot wind direction histogram as vertically stacked bar plots per state
+p_dir_hist <- ggplot(dir_df,
+                     aes(x = WD_bin, y = prop, fill = Type)) +
+  geom_col(width = 0.85, show.legend = FALSE) +       # draw proportional bars
+  facet_grid(Type ~ ., switch = "y") +                # vertically stack Background & Operational
+  scale_fill_manual(values = cols) +                  # apply custom fill colours
+  labs(title = "Wind-Direction Histogram",            # plot title and axis labels
+       x = "Wind direction (30° sectors)", y = "Proportion (%)") +
+  theme_minimal(base_size = 11) +                     # use minimal theme
+  theme(
+    strip.placement = "outside",                      # place facet labels outside the panel
+    strip.text.y    = element_text(angle = 0, hjust = .5),  # rotate facet labels
+    axis.text.x     = element_text(angle = 45, hjust = 1),  # slant x-axis labels for readability
+    panel.grid.major.x = element_blank()              # remove vertical grid lines
+  )
+
+print(p_dir_hist)
+```
+```{r}
+### Plot 4 - Relationship Between Wind Direction and log-Energy by Turbine State
+
+# Define custom colors for Background and Operational types
+cols <- c("Background"="#e41a1c",
+          "Operational"="#377eb8")
+
+# Create scatter plot of log-energy vs wind direction with LOESS smoothing
+p_dir <- ggplot(energy, aes(Wind.dir, logE, colour = Type)) +
+  geom_point(alpha = .45) +                  # Add semi-transparent points
+  geom_smooth(method = "loess",              # Add LOESS smooth line for trend
+              formula = y ~ x,               # Explicitly define smoothing formula
+              se = FALSE, linewidth = 1) +   # Remove shaded CI, set line width
+  scale_colour_manual(values = cols, name = "") +             # Apply custom colors
+  scale_x_continuous(breaks = seq(0,360,30)) +                # Set x-axis breaks every 30°
+  labs(title = "log-Energy vs Wind Direction",                # Add axis and title labels
+       x = "Wind direction (°)", y = "log(Energy)") +
+  theme_minimal()                                             # Use minimal theme
+
+# Display plot
+print(p_dir)
+```
+
+
+```{r}
+### Plot 5 - Wind Directional Dependence of RMS Displacement (Polar Plot)
+
+# 1. Define a custom 5-shade blue gradient from light to dark
+blue_grad <- colorRampPalette(brewer.pal(9, "Blues")[3:9])(5)
+
+# 2. Prepare the input data for the rose diagram:
+#    - Rename columns to standard names expected by pollutionRose()
+#    - Extract datetime, wind speed, wind direction, RMS displacement, and turbine status
+rose_df <- energy %>% transmute(
+  date = Datetime,         # time stamp
+  ws   = Wind.speed,       # wind speed
+  wd   = Wind.dir,         # wind direction
+  RMS  = RMS_nm,           # RMS displacement in nanometers
+  Type = Type              # turbine operational status
+)
+
+# 3. Create a pollution rose plot of RMS vs wind direction:
+#    - Use mean RMS per direction bin
+#    - Split by turbine Type
+#    - Apply custom blue color gradient
+#    - Disable the paddle-style legend
+#    - Position the legend to the right
+#    - Set main title for the plot
+pollutionRose(
+  mydata      = rose_df,
+  pollutant   = "RMS",              # variable to plot
+  statistic   = "prop.mean",        # use mean proportion in each bin
+  type        = "Type",             # split by turbine status
+  cols        = blue_grad,          # color palette
+  paddle      = FALSE,              # rectangular legend
+  key.position= "right",            # place legend to the right
+  main        = "Mean RMS (nm) by Wind Direction & State"
+)
+```
+
+```{r}
+### Plot 6 - Integrated Energy vs Wind Speed by Turbine State
+
+# Define custom colours for turbine states
+cols <- c("Background"  = "#1f77b4",
+          "Operational" = "#ff7f0e")
+
+# Scatter plot with loess smoothing: Energy vs Wind Speed
+p_ws_E <- ggplot(energy, aes(Wind.speed, E, colour = Type)) +
+  geom_point(alpha = .4, size = 1.8) +                  # semi-transparent points
+  geom_smooth(method  = "loess",                        # non-parametric smoother
+              formula = y ~ x,                          # specify formula explicitly
+              se      = FALSE,                          # don't show confidence band
+              linewidth = 1) +
+  scale_y_continuous(labels = scientific,              # scientific notation for y-axis
+                     limits = c(0, NA)) +               # lower limit at 0, upper auto
+  scale_colour_manual(values = cols, name = "") +       # apply custom colours
+  labs(title = "Integrated Energy (0.5–8 Hz) vs Wind Speed",  # plot title and labels
+       x = "Wind speed (m/s)",
+       y = expression(E~"(m"^2*")")) +
+  theme_minimal(base_size = 11) +                       # clean theme
+  theme(legend.position = "bottom")                     # place legend below plot
+
+print(p_ws_E)  # display the plot
+```
+```{r}
+### Plot 7 - Relationship Between Wind Speed and RMS Displacement (Faceted by State)
+
+p_scatter <- ggplot(energy, aes(Wind.speed, RMS_nm)) +
+  # Scatter plot of RMS vs Wind Speed, colored and shaped by Type (Background/Operational)
+  geom_point(aes(colour = Type, shape = Type),
+             size = 2.5, alpha = 0.6, stroke = .3) +
+  
+  # Add a LOESS smoothed trend line per Type, with no confidence interval (se = FALSE)
+  geom_smooth(aes(colour = Type),
+              method = "loess", span = .8,
+              se = FALSE, linewidth = 0.9, alpha = .5) +
+  
+  # Create separate facet panels for each Type (faceted by Type)
+  facet_wrap(~ Type, ncol = 2, scales = "free_x") +
+  
+  # Set custom colors for each Type and hide legend (guide = "none")
+  scale_colour_manual(values = c("#1f77b4", "#ff7f0e"), guide = "none") +
+  
+  # Set custom shapes for points and hide legend (guide = "none")
+  scale_shape_manual(values = c(16, 17), guide = "none") +
+  
+  # Titles and axis labels
+  labs(title    = "Raw RMS vs Wind Speed",
+       subtitle = "10-min blocks, 0.5–8 Hz band",
+       x        = "Wind speed (m/s)",
+       y        = "RMS displacement (nm)") +
+  
+  # Minimal theme with adjusted base font size
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),      # Remove minor gridlines for clarity
+    panel.spacing    = unit(1, "lines")      # Increase spacing between facet panels
+  )
+
+# Display the plot
+print(p_scatter)
+```
+```{r}
+### Plot 8 - Mean Frequency-Weighted PSD (0.5–8 Hz) by Turbine State
+cols <- c("Background"="#e41a1c", "Operational"="#377eb8")  # Define custom color palette for each state
+
+psd_mean <- psd_all %>%                        # Use full PSD dataset
+  filter(between(Frequency_Hz, 0.5, 8)) %>%    # Filter for frequency band of interest (0.5–8 Hz)
+  group_by(Type, Frequency_Hz) %>%             # Group by turbine state and frequency
+  summarise(meanPSD = mean(PSD_wtd),           # Compute mean weighted PSD per group
+            .groups="drop")                    # Drop grouping structure after summarizing
+
+p_psd <- ggplot(psd_mean, aes(Frequency_Hz, meanPSD, colour = Type)) +
+  geom_line(size = 1) +                        # Line plot of mean PSD across frequencies
+  scale_colour_manual(values = cols, name = "") +  # Apply manual color scale with no legend title
+  labs(title = "Mean Weighted-PSD (0.5–8 Hz)",      # Add plot title and axis labels
+       x = "Frequency (Hz)", 
+       y = expression("Weighted PSD (m"^2*"/Hz)")) +
+  theme_minimal() +                            # Use minimal theme for clean look
+  theme(legend.position = "right")             # Position legend on the right
+
+print(p_psd)                                   # Display the plot
+```
+
+```{r}
+### Plot 9 - Median log-PSD Spectrum (Weighted)
+
+# 1.  Summary: median log-PSD per frequency & state
+spec_df <- psd_all %>%                          # Start with PSD data (must include PSD_wtd)
+  mutate(logPSD = 10 * log10(PSD_wtd)) %>%      # Convert PSD values to decibels (log10 scale)
+  group_by(Operational, Frequency_Hz) %>%       # Group by turbine state and frequency
+  summarise(med_logPSD = median(logPSD, na.rm = TRUE), .groups = "drop")  # Compute median log-PSD per group
+
+# 2.  Plot
+cols <- c("0" = "#e41a1c",    # red  = Background
+          "1" = "#377eb8")    # blue = Operational
+
+p_spec <- ggplot(spec_df, aes(Frequency_Hz, med_logPSD,       # Set x = frequency, y = median log-PSD
+                              colour = factor(Operational))) + # Colour by turbine state
+  geom_line(size = 0.8, alpha = .9) +                          # Line plot with moderate thickness
+  scale_colour_manual(values = cols,                          # Manual colour assignment
+                      labels = c("Background", "Operational"),# Legend labels
+                      name   = "") +                           # No legend title
+  coord_cartesian(xlim = c(0, 25)) +                          # Zoom in to 0–25 Hz band
+  labs(title = "Median log-PSD Spectrum (Weighted)",         # Plot title and axis labels
+       x = "Frequency (Hz)",
+       y = "Median log-PSD  (dB, m²/Hz)") +
+  theme_minimal(base_size = 11) +                             # Minimal theme with base font size
+  theme(
+    legend.position = "right",                                # Legend on the right
+    panel.grid.minor = element_blank()                        # Remove minor gridlines for clarity
+  )
+
+print(p_spec)                                                 # Render the plot
+```
+```{r}
+### Plot 10 - Autocorrelation of log-Energy
+
+# Ensure time series is sorted chronologically by timestamp
+e_ts <- energy %>% arrange(Datetime) 
+
+# Plot autocorrelation function (ACF) of log-energy values
+# Useful to check for temporal dependence or seasonality in the 10-minute blocks
+acf(e_ts$logE, na.action = na.pass, main = "ACF of log-Energy (10-min samples)")
+```
+
+2. Temporal Patterns
+```{r}
+### Plot 11 - Time Series of RMS Displacement (0.5–8 Hz Band)
+
+# Time-series plot of RMS displacement (in nm) over time, coloured by turbine state
+p_ts <- ggplot(energy, aes(Datetime, RMS_nm, colour = Type)) +
+  geom_line(size = 0.9,        # Use thicker lines for better visibility
+            alpha = 1) +       # Fully opaque lines (no transparency)
+  scale_colour_manual(values = c("#0b5fa5",  # dark blue for Background
+                                 "#d95f02"), # dark orange for Operational
+                      name = "") +           # No legend title
+  labs(title = "RMS (0.5–8 Hz) Over Time",   # Main plot title
+       y = "RMS displacement (nm)",          # Y-axis label
+       x = NULL) +                           # Omit X-axis label (Datetime self-explanatory)
+  theme_minimal() +                          # Apply clean minimal theme
+  theme(legend.position = "bottom")          # Move legend below plot
+
+print(p_ts)                                  # Render the plot
+```
+
+
+```{r}
+### Plot 12 - Median RMS by Hour and Day of Week
+
+# --- Compute median RMS by hour --- #
+hourly_rms <- energy %>%
+  mutate(State = factor(Operational, labels = c("Background", "Operational"))) %>%
+  group_by(Hour, State) %>%
+  summarise(med_rms = median(RMS_nm, na.rm = TRUE), .groups = "drop")
+
+# --- Compute median RMS by weekday --- #
+weekday_rms <- energy %>%
+  mutate(
+    State   = factor(Operational, labels = c("Background", "Operational")),
+    Weekday = factor(weekdays(as.Date(Date)),
+                     levels = c("Monday", "Tuesday", "Wednesday", "Thursday", 
+                                "Friday", "Saturday", "Sunday"),
+                     labels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+  ) %>%
+  group_by(Weekday, State) %>%
+  summarise(med_rms = median(RMS_nm, na.rm = TRUE), .groups = "drop")
+
+# --- Plot A: Median RMS by Hour of Day --- #
+p_hour <- ggplot(hourly_rms, aes(x = Hour, y = med_rms, colour = State)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Median RMS by Hour of Day", x = "Hour (0–23)", y = "RMS (nm)") +
+  scale_colour_manual(values = c("Background" = "#1f77b4", "Operational" = "#ff7f0e")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# --- Plot B: Median RMS by Day of Week, Faceted by State --- #
+p_week <- ggplot(weekday_rms, aes(x = Weekday, y = med_rms, fill = State)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~State, ncol = 1, scales = "free_y") +
+  labs(title = "Median RMS by Day of Week", x = NULL, y = "RMS (nm)") +
+  scale_fill_manual(values = c("Background" = "#1f77b4", "Operational" = "#ff7f0e")) +
+  theme_minimal()
+
+# --- Combine side-by-side with patchwork --- #
+p_hour + p_week + plot_layout(widths = c(1.2, 1))
+```
+```{r}
+# Add Weekday as a factor with correct order (optional)
+energy$Weekday <- factor(weekdays(as.Date(energy$Date)),
+                         levels = c("Monday", "Tuesday", "Wednesday", "Thursday", 
+                                    "Friday", "Saturday", "Sunday"))
+
+### Plot 13 - Log-Energy variation across weekdays by turbine status
+p_weekday <- ggplot(energy, aes(x = Weekday, y = logE, fill = factor(Operational))) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.8, outlier.color = "grey40") +
+  scale_fill_manual(values = c("0" = "#e41a1c", "1" = "#1f77b4"),
+                    labels = c("Background", "Operational"),
+                    name   = "Turbine State") +
+  labs(title = "Log-Energy by Day of Week",
+       x = "Day of Week",
+       y = expression(log~E~"(m"^2*")")) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Print
+print(p_weekday)
+```
+```{r}
+### Plot 14 - Hourly smoothed variation in log-energy, faceted by turbine state
+p_diurnal <- ggplot(energy, aes(x = Hour, y = logE, color = factor(Operational))) +
+  geom_smooth(se = FALSE, linewidth = 1) +
+  scale_color_manual(values = c("0" = "#e41a1c", "1" = "#1f77b4"),
+                     labels = c("Background", "Operational"),
+                     name   = "Turbine State") +
+  scale_x_continuous(breaks = seq(0, 24, by = 3)) +
+  labs(title = "Diurnal Variation in Log Energy",
+       x = "Hour of Day",
+       y = expression(log~E~"(m"^2*")")) +
+  theme_minimal(base_size = 12)
+
+# Print
+print(p_diurnal)
+```
+
+```{r}
+### plot 15 - RMS Displacement (0.5–8 Hz band) vs Regulatory Limit
+
+# Define compliance limit and color palette for turbine states
+limit_nm <- 0.336
+cols      <- c("Background"="#1f77b4", "Operational"="#ff7f0e")
+
+# Summarise RMS stats: mean and 95th percentile by state
+stat_df <- energy %>%
+  group_by(Type) %>%
+  summarise(
+    mean_nm = mean(RMS_nm),                  # mean RMS in nanometers
+    p95_nm  = quantile(RMS_nm, .95)          # 95th percentile RMS
+  ) |>
+  mutate(Type = factor(Type, levels = c("Background","Operational")))  # set plotting order
+
+# Create bar plot with error bars and threshold line
+ggplot(stat_df, aes(Type, mean_nm, fill = Type)) +
+  geom_col(width = .55, colour = "black", show.legend = FALSE) +        # bar: mean value
+  geom_errorbar(aes(ymin = mean_nm, ymax = p95_nm),                     # error bar: up to 95th %ile
+                width = .18, size = .7) +
+  geom_hline(yintercept = limit_nm, linetype = "dashed", colour = "grey40") +  # compliance threshold
+  scale_fill_manual(values = cols) +                                    # color mapping
+  labs(title = "RMS Statistics vs 0.336 nm Limit",                      # plot title and labels
+       y = "nm", x = NULL) +
+  theme_minimal()                                                       # clean theme
+
+```
+```{r}
+### Plot 16 - RMS Displacement vs Turbine State (Boxplot + Threshold)   
+
+p_rms <- energy %>% 
+  mutate(State = factor(Operational, labels = c("Background", "Operational"))) %>% 
+  ggplot(aes(State, RMS_nm, fill = State)) +
+  
+  # Boxplot without outlier points for clarity
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+
+  # Overlay individual jittered points for distribution visibility
+  geom_jitter(width = 0.15, alpha = 0.3, size = 0.6) +
+
+  # Add horizontal reference line for compliance threshold
+  geom_hline(yintercept = limit_nm, lty = 2, colour = "red") +
+
+  # Annotate the threshold line
+  annotate("text", x = 1.5, y = limit_nm * 1.05,
+           label = "0.336 nm limit", color = "red", size = 3) +
+
+  # Custom fill color for state categories
+  scale_fill_manual(values = c("Background" = "#1f77b4",
+                               "Operational" = "#ff7f0e")) +
+
+  # Labels and theme
+  labs(title = "Block RMS Displacement (0.5–8 Hz)",
+       y = "RMS (nm)", x = "") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Display the plot
+print(p_rms)
+```
+
+
+
+
+
+
+
+```{r}
+### STATISTICAL MODELING APPROACH
+
+#  Preprocessing for GAM modeling 
+# Standardize wind speed and wind direction for numerical stability
+energy <- energy %>%
+  mutate(
+    ws_s   = scale(Wind.speed, center = TRUE, scale = TRUE)[,1],  # standardized wind speed
+    wd_s   = scale(Wind.dir,    center = TRUE, scale = TRUE)[,1]  # standardized wind direction
+  )
+
+# Ensure date factor is available for random effect smooth
+energy <- energy %>%
+  mutate(DateF = factor(Date))  # convert Date to factor for s(DateF, bs = "re")
+
+# Count unique values to dynamically select basis dimensions
+n_ws    <- length(unique(energy$Wind.speed))   # number of unique wind speed values
+n_dir   <- length(unique(energy$Wind.dir))     # number of unique wind direction values
+n_hour  <- length(unique(energy$Hour))         # number of unique hourly values
+
+# Set maximum basis size (k) for splines, constrained by unique values
+k_ws    <- min(10, n_ws)    # max 10 basis functions for wind speed
+k_dir   <- min(12, n_dir)   # max 12 for wind direction
+k_hour  <- min(24, n_hour)  # max 24 for hour-of-day (cyclic)
+
+
+```
+
+
+```{r}
+### GAM1: Baseline model with turbine operational status only 
+# This model includes only a parametric effect for turbine state (ON/OFF)
+# It tests the fundamental uplift in seismic energy due to operation
+gam1 <- gam(
+  logE ~ Operational,     # turbine ON/OFF effect (binary)
+  data   = energy,
+  method = "REML"         # use Restricted Maximum Likelihood for smoother estimation
+)
+
+# Summarize model output: coefficient estimates, fit statistics, etc.
+summary(gam1)
+
+# Diagnostic plots: QQ-plot, residuals vs fitted, leverage, etc.
+appraise(gam1)
+
+```
+```{r}
+### GAM2: Additive Linear Effect of Wind Speed 
+# This model extends GAM1 by including wind speed as a *linear* covariate,
+# alongside the binary turbine operational status.
+# Purpose: To assess whether raw wind speed (without smoothing) explains
+# additional variation in log-energy (logE).
+# Note: Wind speed is treated linearly here, not as a smooth function.
+gam2 <- gam(
+  logE ~ Operational + Wind.speed,
+  data   = energy,
+  method = "REML"     # Restricted Maximum Likelihood for smooth estimation
+)
+
+# Summary of model fit and coefficients
+summary(gam2)
+
+# Diagnostic checks: residuals, QQ-plot, leverage, etc.
+appraise(gam2)
+
+```
+
+```{r}
+### GAM3: Add smooth term for wind speed 
+# Model log-energy as a function of turbine operation and a non-linear smooth for wind speed.
+# This allows capturing non-linear background effects of wind speed on seismic energy.
+
+gam3 <- gam(
+  logE ~ Operational + s(Wind.speed, k = k_ws),  # add smooth spline for Wind.speed
+  data   = energy,
+  method = "REML"
+)
+
+# Summarize model: check parametric and smooth term significance
+summary(gam3)
+
+# Visualize smooth function of Wind.speed
+draw(gam3, select = "s(Wind.speed)")
+
+# Residual diagnostics: QQ-plot, residual-vs-fitted, leverage
+appraise(gam3)
+
+```
+
+```{r}
+### GAM4: Add cyclic wind direction term 
+# This model includes:
+# - A baseline operational shift (ON/OFF effect),
+# - A smooth effect for wind speed,
+# - A cyclic smooth for wind direction (0–360° wrapped),
+# - No temporal or date-based variation yet.
+
+gam4 <- gam(
+  logE ~ Operational
+         + s(Wind.speed, k = k_ws)              # smooth for wind speed
+         + s(Wind.dir, bs = "cc", k = k_dir),   # cyclic smooth for wind direction
+  data   = energy,
+  method = "REML",
+  knots  = list(Wind.dir = c(0, 360))           # enforce cyclicity from 0 to 360 degrees
+)
+
+# Display model summary including significance of each term
+summary(gam4)
+
+# Plot smooth terms for wind speed and wind direction
+draw(gam4, select = c("s(Wind.speed)", "s(Wind.dir)"))
+
+# Run diagnostic checks: residual plots, QQ, histogram, etc.
+appraise(gam4)
+
+```
+
+
+```{r}
+# GAM5: Add cyclic wind-direction and daily random effect 
+# This model includes:
+# - Operational status as a parametric term
+# - A smooth spline for wind speed (linear basis)
+# - A cyclic cubic spline ("cc") for wind direction
+# - A random intercept smooth for date (captures unobserved day-level heterogeneity)
+
+gam5 <- gam(
+  logE ~ Operational                         # binary effect of turbine operation
+         + s(Wind.speed, k = k_ws)           # spline for wind speed
+         + s(Wind.dir, bs = "cc", k = k_dir) # cyclic spline for wind direction (0-360°)
+         + s(DateF, bs = "re"),              # random effect for each day
+  data   = energy,
+  method = "REML",                           # penalized likelihood estimation
+  knots  = list(Wind.dir = c(0,360))         # specify cyclic bounds for Wind.dir
+)
+
+# Output summary of model fit: coefficients, EDFs, p-values
+summary(gam5)
+
+# Visualize selected smooth terms: Wind direction and Date-level effects
+draw(gam5, select = c("s(Wind.dir)", "s(DateF)"))
+
+# Check residuals, QQ plot, leverage, fitted vs residuals
+appraise(gam5)
+
+```
+
+```{r}
+# GAM6: Add diurnal cycle to previous model
+# This model includes:
+#   - A parametric term for turbine operational status (Operational)
+#   - Smooth terms for wind speed and wind direction (cyclic)
+#   - A random effect smooth for day-level variability (s(DateF, bs = "re"))
+#   - A cyclic smooth for hour-of-day effects (s(Hour, bs = "cc"))
+# The cyclic bases (bs = "cc") enforce continuity at endpoints (e.g., 0 = 24)
+
+gam6 <- gam(
+  logE ~ Operational                      # binary ON/OFF shift
+         + s(Wind.speed, k = k_ws)       # smooth effect of wind speed
+         + s(Wind.dir,    bs = "cc", k = k_dir)  # cyclic wind direction smooth
+         + s(DateF,       bs = "re")     # random effect for daily fluctuations
+         + s(Hour,        bs = "cc", k = k_hour),# diurnal cyclic smooth
+  data   = energy,
+  method = "REML",                       # restricted maximum likelihood
+  knots  = list(Wind.dir = c(0, 360),    # enforce periodicity in wind direction
+                Hour     = c(0, 24))     # and hour-of-day
+)
+
+# Model diagnostics and visualization
+summary(gam6)                  # inspect coefficients and smooth significance
+draw(gam6, select = "s(Hour)") # visualize the diurnal effect
+appraise(gam6)                 # residual diagnostics (QQ, hist, etc.)
+
+```
+
+```{r}
+# ### Model Selection via AIC 
+# Compare Akaike Information Criterion (AIC) values across candidate models:
+#   - Lower AIC indicates a better trade-off between model fit and complexity
+#   - Used here to evaluate which GAM best explains variation in logE
+#     while penalising excessive smoothness or overfitting
+
+AIC(gam1, gam2, gam3, gam4, gam5, gam6)
+
+```
+```{r}
+# GAM5: Incorporating Temporal Random Effects 
+# Model formula:
+#   logE ~ Operational + s(Wind.speed) + s(Wind.dir) + s(DateF, bs = "re")
+# 
+# This model extends previous specifications by:
+#   - Including a random effect (`s(DateF, bs = "re")`) to account for 
+#     unobserved daily variation in seismic energy.
+#   - Capturing both environmental drivers (wind speed & direction)
+#     and operational state (turbine ON/OFF).
+#   - Allowing `Wind.dir` to vary smoothly and cyclically.
+#
+# Summary provides parametric and smooth term significance.
+summary(gam5)
+
+# --- Visual Diagnostics: Smooth Terms -------------------------------------
+# Plot the estimated smooth functions for wind speed, direction, and
+# random daily variation to assess their functional forms and confidence intervals.
+draw(gam5, rug = FALSE)
+
+# Residual Diagnostics 
+# Assess model fit and assumption validity:
+#   - Residual-vs-fitted plots
+#   - Normal Q-Q plot
+#   - Histogram of residuals
+#   - Leverage and influential point check
+appraise(gam5)
+
+```
+```{r}
+
+# GAM 7: Add cyclic smooth for Hour to previous model 
+gam7 <- gam(
+  logE ~ 
+    Operational +                                   # binary ON/OFF turbine effect
+    s(Wind.speed, k = k_ws) +                       # smooth wind speed effect
+    s(Wind.dir,    bs = "cc", k = k_dir) +          # cyclic spline for wind direction (0–360°)
+    s(DateF,       bs = "re") +                     # random effect for each date
+    s(Hour,        bs = "cc", k = k_hour),          # cyclic spline for hour-of-day (0–24)
+  data   = energy,
+  method = "REML",                                  # restricted maximum likelihood
+  knots  = list(                                    # ensure proper knot placement for cyclic terms
+    Wind.dir = c(0, 360),
+    Hour     = c(min(energy$Hour), max(energy$Hour))
+  )
+)
+
+#  Model summary and diagnostics 
+summary(gam7)                        # check coefficients, EDFs, and p-values
+draw(gam7, select = "s(Hour)")       # visualize diurnal variation
+appraise(gam7)                       # residuals, QQ plot, leverage
+
+#  Compare AIC across GAM 5–7 
+AIC(gam5, gam6, gam7)                # lower AIC indicates better fit
+
+
+```
+
+```{r}
+# GAM with Interaction: Wind Speed × Operational Status + Temporal Effects 
+gam_int <- gam(
+  logE ~ 
+    s(Wind.speed,                    k = k_ws) +                  # baseline wind-speed effect
+    s(Wind.speed, by = Operational, k = k_ws) +                  # additional effect when turbines ON
+    s(Wind.dir,    bs = "cc",       k = k_dir) +                 # cyclic spline for wind direction
+    s(Hour,        bs = "cc",       k = k_hour) +                # diurnal cyclic spline
+    s(DateF,       bs = "re") +                                  # daily random effects
+    Operational,                                                  # parametric shift (ON vs OFF)
+  data   = energy,
+  method = "REML",
+  knots  = list(
+    Wind.dir = c(0, 360),                                       # enforce cyclicity in wind direction
+    Hour     = c(min(energy$Hour), max(energy$Hour))           # enforce cyclicity for time-of-day
+  )
+)
+
+# Model diagnostics and visualization 
+summary(gam_int)                                              # model summary
+draw(gam_int, select = c("s(Wind.speed)",
+                         "s(Wind.speed):Operational",
+                         "s(Hour)"))                          # plot key smooth terms
+appraise(gam_int)                                             # residual diagnostics
+AIC(gam5, gam6, gam_int)                                      # model comparison using AIC
+
+```
+```{r}
+### Final Generalized Additive Model (GAM) 
+# Best model based on AIC, residual diagnostics, and smooth term significance
+
+gam_combo <- gam(
+  logE ~
+    Operational +                               # baseline ON/OFF shift due to turbines
+    s(Wind.speed, k = k_ws) +                   # smooth background wind-speed effect
+    s(Wind.speed, by = Operational, k = k_ws) + # interaction: wind-speed effect under turbine ON
+    s(Wind.dir,    bs = "cc", k = k_dir) +      # cyclic spline for wind direction
+    s(DateF,       bs = "re"),                  # random intercept per day
+  data   = energy,
+  method = "REML",
+  knots  = list(Wind.dir = c(0, 360))           # ensure cyclicity in wind direction
+)
+
+# Model summary (parametric + smooth terms)
+summary(gam_combo)
+
+# Visualize partial effects of wind speed (overall and by operational state)
+draw(gam_combo, select = c("s(Wind.speed)", "s(Wind.speed):Operational"))
+
+# Visualize all smooths for interpretability
+draw(gam_combo, select = c("s(Wind.speed)", "s(Wind.speed):Operational", 
+                           "s(Wind.dir)", "s(DateF)"))
+
+### Residual Diagnostics 
+
+# Extract Pearson residuals for autocorrelation check
+resid_combo <- resid(gam_combo, type = "pearson")
+
+# Autocorrelation function (ACF) plots at 10-min lag intervals
+acf(resid_combo, lag.max = 48, main = "ACF of gam_combo Residuals (10 min lags)")
+acf(resid(gam_combo), main = "ACF of GAM_combo residuals")
+
+# Standardized residuals (deviance scale) for QQ plot
+z_resid <- scale(resid(gam_combo, type = "deviance"))[,1]
+qq_df <- data.frame(sample = z_resid)
+
+# QQ-plot to assess normality of residuals
+ggplot(qq_df, aes(sample = sample)) +
+  stat_qq() + stat_qq_line() +
+  labs(title = "QQ-plot of Standardised Residuals (z-scale)",
+       x = "Theoretical quantiles", y = "Sample quantiles") +
+  theme_minimal()
+
+### AIC Comparison Across Competing GAMs 
+# Compare Akaike Information Criterion for model selection
+AIC(gam1, gam2, gam3, gam4, gam5, gam6, gam_int, gam_combo)
+
+```
+
+```{r}
+### Estimated Effect of Turbine Operation on Seismic Energy 
+
+# Extract the GAM coefficient for turbine operation (log-scale effect)
+beta_op <- coef(gam_combo)["Operational"]                       # point estimate
+se_op   <- sqrt(vcov(gam_combo)["Operational", "Operational"]) # standard error
+
+
+# Compute 95% confidence interval on the log-scale
+ci_log  <- beta_op + c(-1.96, 1.96) * se_op
+
+# Convert to the multiplicative energy scale 
+
+mult    <- exp(beta_op)     # multiplier: E_op / E_bg
+ci_mul  <- exp(ci_log)      # 95% CI on multiplicative scale
+
+
+# Report effect of turbine operation 
+
+cat(
+  sprintf("Multiplier (turbines ON / OFF) = %.12f\n",  mult),
+  sprintf("95%% confidence interval        = [%.12f, %.12f]\n",
+          ci_mul[1], ci_mul[2])
+)
+
+```
+```{r}
+### Energy Uplift Calculation: Background vs Operational 
+
+# Compute mean integrated seismic energy in each turbine state
+E_bg  <- mean(energy$E[energy$Operational == 0], na.rm = TRUE)   # mean energy during background (turbines OFF)
+E_op  <- mean(energy$E[energy$Operational == 1], na.rm = TRUE)   # mean energy during operational (turbines ON)
+E_all <- mean(energy$E,                       na.rm = TRUE)      # mean energy across all samples
+
+# Calculate absolute and relative uplift due to turbine operation
+deltaE <- E_op - E_bg               # absolute difference in mean energy
+mult   <- E_op / E_bg               # multiplicative uplift factor (ratio)
+
+
+# Display formatted results 
+
+cat(
+  sprintf("Mean background energy (E_bg)      = %.3e  m²\n", E_bg),
+  sprintf("Mean operational energy (E_op)     = %.3e  m²\n", E_op),
+  sprintf("Overall mean energy  (E_all)       = %.3e  m²\n\n", E_all),
+  sprintf("Absolute uplift  ΔE  (E_op - E_bg) = %.3e  m²\n", deltaE),
+  sprintf("Multiplicative uplift (E_op / E_bg)= %.12f ×\n", mult)
+)
+
+```
+```{r}
+### Estimate Turbine-ON Effect in Decibels 
+
+# Extract coefficient and standard error for 'Operational' term from GAM
+beta_op <- coef(gam_combo)["Operational"]                             # log-scale coefficient
+se_op   <- sqrt(vcov(gam_combo)["Operational", "Operational"])       # standard error
+
+# Convert log-scale estimate to decibels (dB)
+ln10     <- log(10)                                                  # natural log of 10 for conversion
+delta_dB <- 10 * beta_op / ln10                                      # estimated dB uplift
+se_dB    <- 10 * se_op  / ln10                                       # standard error in dB
+ci_dB    <- delta_dB + c(-1.96, 1.96) * se_dB                         # 95% confidence interval
+
+# Nicely formatted output
+cat(
+  "Turbine-ON increment (0.5–8 Hz band)\n",
+  sprintf("Δ = %.3e dB",  delta_dB), "\n",
+  sprintf("95%% CI = [%.3e, %.3e] dB", ci_dB[1], ci_dB[2]), "\n"
+)
+
+
+```
+
+```{r}
+# 1. Convert Energy (E, in m²) to RMS Displacement (nm)
+#    Formula: RMS = √E       [E = integrated PSD over 0.5–8 Hz]
+#    Conversion: 1 metre = 1e9 nanometres
+
+energy <- energy %>%
+  mutate(
+    RMS_m  = sqrt(E),        # RMS displacement in metres
+    RMS_nm = RMS_m * 1e9     # Convert to nanometres
+  )
+
+
+# 2. Summarise RMS Displacement by Turbine Operational State
+#    Statistics: mean, 95th percentile, and maximum
+
+summary_nm <- energy %>%
+  group_by(Type, Operational) %>%  # “Background” (0) and “Operational” (1)
+  summarise(
+    mean_nm = mean(RMS_nm, na.rm = TRUE),             # average RMS
+    p95_nm  = quantile(RMS_nm, 0.95, na.rm = TRUE),   # 95th percentile
+    max_nm  = max(RMS_nm, na.rm = TRUE),              # maximum value
+    .groups = "drop"
+  )
+
+print(summary_nm)
+
+
+# 3. Compare Results to the Eskdalemuir Defensible Threshold
+#    Limit: 0.336 nm (maximum RMS displacement allowed)
+
+limit_nm <- 0.336  # specified defensible RMS threshold
+
+# Calculate percentage of the limit
+summary_nm %>%
+  mutate(
+    mean_pct = mean_nm / limit_nm * 100,  # % of threshold (mean)
+    p95_pct  = p95_nm  / limit_nm * 100,  # % of threshold (95th percentile)
+    max_pct  = max_nm  / limit_nm * 100   # % of threshold (max)
+  ) %>%
+  select(Type, starts_with("mean_"), starts_with("p95_"), starts_with("max_")) %>%
+  knitr::kable(digits = 2,
+    col.names = c("State", "Mean RMS (nm)", "% of Limit",
+                  "95th-%ile RMS (nm)", "% of Limit",
+                  "Max RMS (nm)", "% of Limit"))
+
+```
+
+
+MODELLING & RESULTS PLOTS
+```{r}
+### Plot 1 - GAM Diagnostic Checks: Basis Dimension & Residual Inspection  
+
+# 1. Check adequacy of basis dimension (k-index):
+#    - A k-index < 1.2 indicates that the chosen basis dimension is sufficient.
+#    - A value > 1.2 may suggest underfitting or the need for higher k in s() terms.
+gam.check(gam_combo)
+
+# 2. Visual diagnostic: Residuals plotted over each smooth term
+#    - Uses 'gratia' package to draw smooth terms with residual clouds.
+#    - Helps visually assess model fit and detect systematic bias.
+#    - Grey points represent residuals; patterns could indicate poor fit.
+draw(gam_combo, residuals = TRUE)
+
+```
+```{r}
+### Plot 2 - Observed vs Fitted Energy Plot
+
+cols <- c("Background" = "#1f77b4", "Operational" = "#ff7f0e")   # Define colour palette for turbine states
+limit_nm <- 0.336                                                # Compliance RMS displacement threshold in nm
+
+obs_fit <- energy %>%
+  mutate(Fitted = exp(fitted(gam_combo)))     # Back-transform log-scale model predictions to original energy scale
+
+ggplot(obs_fit, aes(Fitted, E, colour = Type)) +  # Scatterplot: Fitted vs Observed Energy, coloured by turbine state
+  geom_point(alpha = .6) +                        # Semi-transparent points for visual clarity
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +  # Identity line to indicate perfect prediction
+  scale_colour_manual(values = cols, name = "") +               # Apply custom colours with no legend title
+  labs(title = "Observed vs Fitted Energy",                     # Axis titles and plot title
+       x = "Fitted E (m²)", y = "Observed E (m²)") +
+  theme_minimal()                                               # Clean, minimal visual style
+
+```
+
+
+
+Predictor Effect Visualizations
+```{r}
+### Plot 3 - Predicted Energy vs Wind Speed (ON vs OFF) 
+
+# Grid of speeds in observed range
+grid_ws <- data.frame(
+  Wind.speed  = seq(min(energy$Wind.speed), max(energy$Wind.speed), length = 200),  # sequence of wind speeds
+  Wind.dir    = mean(energy$Wind.dir),         # hold wind direction at mean
+  DateF       = energy$DateF[1]                # fixed date factor for prediction
+)
+
+# Add Operational status = 0 (Background) and = 1 (Operational) to grid
+grid_ws_bg <- cbind(grid_ws, Operational = 0)
+grid_ws_op <- cbind(grid_ws, Operational = 1)
+
+# Predict energy for both states and combine results
+p_ws <- bind_rows(
+  grid_ws_bg  |> 
+    mutate(Type = "Background",
+           fit  = exp(predict(gam_combo, newdata = grid_ws_bg))),  # back-transform log prediction
+  grid_ws_op  |> 
+    mutate(Type = "Operational",
+           fit  = exp(predict(gam_combo, newdata = grid_ws_op)))   # back-transform log prediction
+) |> 
+  ggplot(aes(Wind.speed, fit, colour = Type)) +  # plot fitted energy vs wind speed
+    geom_line(size = 1.1) +                      # add smooth lines
+    scale_colour_manual(values = cols, name = "") +  # custom colour mapping
+    labs(title = "Predicted Energy vs Wind Speed",
+         x = "Wind speed (m/s)", y = "E (m²)") +
+    theme_minimal()                              # clean theme
+
+# Display the plot
+print(p_ws)
+
+
+```
+```{r}
+# Plot 4 - Daily Random Intercepts – Smooth Term s(DateF)
+
+# 1. Extract daily intercepts from s(DateF)
+#    - Each date gets its own partial effect (random smooth)
+#    - These reflect baseline energy shifts per day
+re_df <- tibble(
+  Date      = as.Date(levels(energy$DateF)),   # Convert factor to Date
+  Intercept = coef(gam_combo)[grep("^s\\(DateF\\)", names(coef(gam_combo)))]  # Extract coefficients for s(DateF)
+)
+
+# 2. Plot: Daily shifts in log-energy baseline
+#    - Useful for visualizing temporal heterogeneity
+p_day <- ggplot(re_df, aes(Date, Intercept)) +
+  geom_line(color = "#2ca02c", alpha = .7) +     # green line
+  geom_point(color = "#2ca02c") +                # green dots
+  labs(
+    title = "Day-to-Day Baseline Shifts  s(DateF)",
+    y     = "Log-energy shift"
+  ) +
+  theme_minimal()
+
+# 3. Display plot
+print(p_day)
+
+```
+```{r}
+### Plot 5 - Directional Amplification via s(Wind.dir) Term  
+
+# 1. Extract smooth estimates for s(Wind.dir)
+#    - The term shows how energy is amplified as a function of wind direction
+#    - Convert log-scale effect to multiplicative factor on energy
+dir_eff <- smooth_estimates(gam_combo, select = "s(Wind.dir)", n = 200) %>% 
+  transmute(
+    Wind.dir = Wind.dir,
+    mult     = exp(.estimate),                 # effect multiplier
+    lo       = exp(.estimate - 1.96 * .se),    # 95% CI lower bound
+    hi       = exp(.estimate + 1.96 * .se)     # 95% CI upper bound
+  )
+
+# 2. Plot: Polar (rose) chart of directional effect
+#    - Ribbon shows confidence interval
+#    - Line represents estimated multiplier
+#    - Helps visualize directionality of seismic energy amplification
+p_rose <- ggplot(dir_eff, aes(Wind.dir, mult)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#1f77b4", alpha = .4) +
+  geom_line(color = "#1f77b4") +
+  coord_polar(start = -pi/12) +  # rotate start angle
+  scale_x_continuous(
+    breaks = seq(0, 330, 30),
+    labels = paste0(seq(0, 330, 30), "°")
+  ) +
+  labs(title = "Directional Amplification s(Wind.dir)",
+       y = "Multiplier on Energy") +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank()
+  )
+
+# 3. Display plot
+print(p_rose)
+
+```
+```{r}
+### Plot 6 - Wind Speed Interaction Curves — GAM-predicted Energy (E)
+
+# 1. Define grid of wind speeds
+ws_seq <- seq(min(energy$Wind.speed),
+              max(energy$Wind.speed),
+              length.out = 200)
+
+# 2. Create prediction grid
+#    - Vary wind speed across observed range
+#    - Fix wind direction and date
+#    - Include both turbine states: Operational and Background
+grid_ws <- expand_grid(
+  Wind.speed  = ws_seq,
+  ws_s        = (ws_seq - mean(energy$Wind.speed)) / sd(energy$Wind.speed),  # scaled wind speed
+  Wind.dir    = mean(energy$Wind.dir),   # fixed average direction
+  DateF       = first(energy$DateF),     # fixed date (could use median too)
+  Operational = c(0, 1)                  # both states
+)
+
+# 3. Predict from GAM model (log-scale)
+prd_ws <- predict(gam_combo, newdata = grid_ws, se.fit = TRUE)
+
+# 4. Back-transform predictions and structure output
+plot_ws <- grid_ws %>%
+  mutate(
+    fit   = exp(prd_ws$fit),                               # mean predicted energy
+    lo    = exp(prd_ws$fit - 1.96 * prd_ws$se.fit),        # lower CI
+    hi    = exp(prd_ws$fit + 1.96 * prd_ws$se.fit),        # upper CI
+    State = factor(Operational, labels = c("Background", "Operational"))
+  )
+
+# 5. Plot: Energy vs Wind Speed by turbine state
+p_ws <- ggplot(plot_ws, aes(Wind.speed, fit, colour = State, fill = State)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.20, colour = NA) +
+  geom_line(size = 1) +
+  labs(
+    title = "Predicted Energy vs. Wind Speed",
+    x     = "Wind speed (m/s)",
+    y     = expression(E~(m^2)),
+    colour = "", fill = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_ws)
+
+
+```
+
+```{r}
+### Plot 7 - Model-Predicted Energy vs Wind Direction
+
+# Create prediction grid for wind direction 
+
+# Define a grid of wind direction values (0° to 360°)
+wd_grid <- data.frame(
+  Wind.dir   = seq(0, 360, length = 360),         # 1° resolution
+  Wind.speed = mean(energy$Wind.speed),           # hold wind speed constant
+  DateF      = energy$DateF[1]                    # representative date
+)
+
+# Add turbine operational states to grid
+grid_bg <- cbind(wd_grid, Operational = 0)        # Background scenario
+grid_op <- cbind(wd_grid, Operational = 1)        # Operational scenario
+
+# Predict model output across wind directions 
+
+# Combine predictions under both states
+pred_dir <- bind_rows(
+  grid_bg |> mutate(Type = "Background",
+                    fit  = exp(predict(gam_combo, newdata = grid_bg))),   # back-transform log(E)
+  grid_op |> mutate(Type = "Operational",
+                    fit  = exp(predict(gam_combo, newdata = grid_op)))
+)
+
+# Plot: Model-Predicted Energy vs Wind Direction 
+
+p_wd <- ggplot(pred_dir, aes(Wind.dir, fit, colour = Type)) +
+  geom_line(size = 1.1) +
+  scale_colour_manual(values = cols, name = "") +
+  scale_x_continuous(breaks = seq(0, 360, by = 60)) +
+  labs(title = "Model-Predicted Energy vs Wind Direction",
+       x = "Wind direction (°)",
+       y = expression(E~(m^2))) +
+  theme_minimal()
+
+# Print the plot
+print(p_wd)
+
+```
+
+
+
+SUMMARY AND COMPLIANCE
+
+```{r}
+### Plot 8 - Block RMS Statistics vs Compliance Threshold                    
+# Summary of mean and 95th percentile RMS displacement by turbine state#
+
+# 1. Summarize RMS statistics (mean and 95th percentile) by turbine state
+summary_nm <- energy %>%
+  group_by(State = factor(Operational,
+                          labels = c("Background", "Operational"))) %>%
+  summarise(
+    mean_nm = mean(RMS_nm),
+    p95_nm  = quantile(RMS_nm, 0.95),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(mean_nm, p95_nm),
+               names_to = "Metric", values_to = "value")
+
+# 2. Create bar plot comparing statistics against 0.336 nm threshold
+p_bar <- ggplot(summary_nm,
+                aes(x = Metric, y = value, fill = State)) +
+
+  # Bar plot with dodged positioning for comparability
+  geom_col(position = position_dodge(width = 0.6), width = 0.55) +
+
+  # Add compliance limit line (e.g., Eskdalemuir threshold)
+  geom_hline(yintercept = limit_nm, linetype = 2, colour = "red") +
+
+  # Annotate threshold label
+  annotate("text", x = 1.75, y = limit_nm * 1.03,
+           label = "0.336 nm limit", colour = "red", hjust = 0) +
+
+  # Clean up axis labels and colors
+  scale_x_discrete(labels = c("Mean", "95-th %")) +
+  scale_fill_manual(values = c("Background" = "#1f77b4",
+                               "Operational" = "#ff7f0e"),
+                    name = "") +
+
+  # Titles and theme
+  labs(title = "Block RMS Statistics vs Compliance Threshold",
+       x = NULL, y = "RMS (nm)") +
+  theme_minimal()
+
+# 3. Print the plot
+print(p_bar)
+
+```
+
+```{r}
+### Plot 9 - ECDF of RMS Displacement (nm)
+
+# Empirical Cumulative Distribution Function (ECDF) of RMS Displacement
+energy |> ggplot(aes(RMS_nm, colour = Type)) +
+  
+  # Plot ECDF curves for each turbine state
+  stat_ecdf(size = 1.1) +
+  
+  # Add compliance threshold line at 0.336 nm
+  geom_vline(xintercept = limit_nm, linetype = "dashed") +
+  
+  # Manually set line colours for each turbine state
+  scale_colour_manual(values = cols, name = "") +
+  
+  # Add title and axis labels
+  labs(title = "ECDF of RMS (nm) — 0.5–8 Hz",
+       x = "RMS displacement (nm)", y = "Empirical CDF") +
+  
+  # Annotate the compliance limit line with a label
+  annotate("text", x = limit_nm*1.03, y = .05,
+           label = "0.336 nm limit", hjust = 0, colour = "grey30") +
+  
+  # Apply minimal theme
+  theme_minimal()
+
+```
