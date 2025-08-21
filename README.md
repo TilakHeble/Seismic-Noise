@@ -7,12 +7,12 @@ Overview
 
 This repo contains the analysis, code, and figures for assessing turbine-attributed uplift in seismic energy near EKA. We pre-process vertical velocity to frequency space, apply a Frequency-Domain Weighting Function (FDWF) to emphasise 0.5–8 Hz, integrate to a scalar energy metric, aggregate to 10-min windows, and fit a GAM with:
 
-operational status (on/off),
+1. operational status (on/off),
 
-smooth wind speed and speed × operational interaction,
+2. smooth wind speed and speed × operational interaction,
 
-cyclic wind direction smooth,
+3. cyclic wind direction smooth,
 
-day-level random effect.
+4. day-level random effect.
 
 Key result. Turbine operation produces a detectable uplift (~20%) in the weighted energy metric, strongest for south-westerly winds (≈130–150°). RMS displacement during operation peaks at 0.177 nm, well below the 0.336 nm compliance limit → no current compliance risk.
