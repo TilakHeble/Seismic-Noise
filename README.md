@@ -1,4 +1,4 @@
-#Quantifying Wind-Turbine–Induced Seismic Noise (EKA–WS12)
+# Quantifying Wind-Turbine–Induced Seismic Noise (EKA–WS12)
 
 Generalised Additive Modelling (GAM) of turbine uplift in the 0.5–8 Hz band
 Eskdalemuir Seismic Array (EKA), borehole WS12 — Scotland, UK
